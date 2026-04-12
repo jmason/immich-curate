@@ -9,8 +9,8 @@ Each run replaces the contents of the output directory so downstream scripts
 always see a fresh set.
 
 Environment variables:
-  IMMICH_URL      Base URL of the Immich instance (e.g. https://immich.home.taint.org)
-  IMMICH_API_KEY  API key (create one in Immich → User → API Keys)
+- IMMICH_URL      Base URL of the Immich instance (e.g. https://immich.home.taint.org)
+- IMMICH_API_KEY  API key (create one in Immich → User → API Keys)
 
 Usage:
   ./immich-curate.py [--output DIR] [--count N]

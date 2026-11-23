@@ -9,10 +9,13 @@
 """
 Curate a selection of "good" photos from an Immich server into a local directory.
 
-Strategy (in priority order):
-  1. "On this day" memories — photos from the same month-day in previous years
-  2. Favorites — photos the user has explicitly starred
-  3. Random — if neither source yields enough, fill the rest randomly
+Sources (proportions tunable via CLI flags):
+  - Random — random photos from the whole library
+  - "On this day" memories — photos from the same month-day in previous years
+  - Favorites — photos the user has explicitly starred
+
+The default mix is 90 % random, 8 % memories, 2 % favorites.  Override with
+--random-pct, --memory-pct, --favorite-pct (must sum to 100).
 
 Each run replaces the contents of the output directory so downstream scripts
 always see a fresh set.
@@ -23,6 +26,7 @@ Environment variables:
 
 Usage:
   ./immich-curate.py [--output DIR] [--count N]
+                     [--random-pct P] [--memory-pct P] [--favorite-pct P]
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import sys
 from datetime import date, datetime
@@ -165,14 +170,26 @@ def getMemories(client: httpx.Client, today: date) -> list[dict[str, Any]]:
                 # If we can't parse the date, still include — the server
                 # already filtered for relevance.
                 assets.append(asset)
-    return assets
+
+    # The memories endpoint omits people, so fetch each full asset record.
+    full: list[dict[str, Any]] = []
+    for asset in assets:
+        resp = client.get(f"/api/assets/{asset['id']}")
+        if resp.status_code == 200:
+            full.append(resp.json())
+    return full
+
+
+# Search filters shared by the favorites and random queries.  "timeline"
+# excludes archived assets and the hidden motion clips of live photos.
+_SEARCH_FILTERS: dict[str, Any] = {"visibility": "timeline", "withPeople": True}
 
 
 def getFavorites(client: httpx.Client, count: int) -> list[dict[str, Any]]:
     """Fetch up to *count* favorited assets via metadata search."""
     resp = client.post(
         "/api/search/metadata",
-        json={"isFavorite": True, "size": count, "page": 1},
+        json={"isFavorite": True, "size": count, "page": 1, **_SEARCH_FILTERS},
     )
     resp.raise_for_status()
     data = resp.json()
@@ -180,8 +197,10 @@ def getFavorites(client: httpx.Client, count: int) -> list[dict[str, Any]]:
 
 
 def getRandomAssets(client: httpx.Client, count: int) -> list[dict[str, Any]]:
-    """Fetch *count* random assets."""
-    resp = client.get("/api/assets/random", params={"count": count})
+    """Fetch *count* random assets (the server caps one call at 1000)."""
+    resp = client.post(
+        "/api/search/random", json={"size": min(count, 1000), **_SEARCH_FILTERS}
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -238,7 +257,13 @@ def downloadAsset(client: httpx.Client, assetId: str, outPath: Path) -> tuple[bo
 # ---------------------------------------------------------------------------
 
 def writeSidecar(outPath: Path, asset: dict[str, Any]) -> None:
-    """Write a small JSON sidecar next to the image with useful metadata."""
+    """Write a JSON sidecar at <outPath>.json with useful metadata.
+
+    The sidecar appends ``.json`` rather than replacing the suffix so that
+    e.g. ``001.jpg`` and ``001.mov`` get separate sidecars
+    (``001.jpg.json`` and ``001.mov.json``) instead of clobbering one
+    another.
+    """
     info = {
         "assetId": asset.get("id"),
         "originalFileName": asset.get("originalFileName"),
@@ -247,75 +272,152 @@ def writeSidecar(outPath: Path, asset: dict[str, Any]) -> None:
         "description": asset.get("exifInfo", {}).get("description"),
         "isFavorite": asset.get("isFavorite"),
     }
-    sidecar = outPath.with_suffix(".json")
+    sidecar = outPath.with_name(outPath.name + ".json")
     sidecar.write_text(json.dumps(info, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Metadata filter
+# ---------------------------------------------------------------------------
+
+MIN_IMAGE_PIXELS = 1_000_000
+
+# WhatsApp names its files e.g. IMG-20200319-WA0013.jpg.
+_WHATSAPP_NAME = re.compile(r"^(img|vid)-\d{8}-wa\d+", re.IGNORECASE)
+
+
+def rejectReason(asset: dict[str, Any]) -> str | None:
+    """Return why *asset* should be skipped, based on its Immich metadata.
+
+    Returns None if the asset is acceptable.  Pre-condition: *asset* came
+    from a request that included people (withPeople, or a full asset fetch).
+
+    >>> rejectReason({"visibility": "hidden", "type": "VIDEO"})
+    'not on timeline (hidden)'
+    """
+    visibility = asset.get("visibility", "timeline")
+    if visibility != "timeline":
+        return f"not on timeline ({visibility})"
+
+    name = (asset.get("originalFileName") or "").lower()
+    if "screenshot" in name or "screen shot" in name:
+        return "screenshot"
+    if _WHATSAPP_NAME.match(name):
+        return "WhatsApp"
+
+    if asset.get("type") != "IMAGE":
+        return None
+
+    pixels = (asset.get("width") or 0) * (asset.get("height") or 0)
+    if pixels < MIN_IMAGE_PIXELS:
+        return f"low resolution ({pixels / 1e6:.1f} MP)"
+    if not any(p.get("name") for p in asset.get("people") or []):
+        return "no named person"
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
 
-def curate(client: httpx.Client, count: int) -> list[dict[str, Any]]:
+def curate(
+    client: httpx.Client,
+    count: int,
+    randomPct: float,
+    memoryPct: float,
+    favoritePct: float,
+) -> list[dict[str, Any]]:
     """Build a deduplicated candidate list from a mix of sources.
 
-    Target mix (of the final *count* photos, before interestingness filtering):
-      ~40 % "on this day" memories
-      ~20 % favorites
-      ~40 % random from the whole library
-
-    Each source is over-fetched to compensate for the interestingness filter
-    rejecting some.  The candidates are shuffled so the download loop picks
-    from a varied pool rather than exhausting one source before the next.
+    The three percentages give the target share of *count* photos drawn from
+    each source (random, "on this day" memories, favorites).  They must sum
+    to 100.  Each source is over-fetched to compensate for the
+    interestingness filter rejecting some, and shuffled so the download loop
+    picks from a varied pool rather than exhausting one source before the
+    next.
     """
+    # Pre-condition: the three percentages sum to 100.
+    assert abs((randomPct + memoryPct + favoritePct) - 100.0) < 0.01, \
+        "percentages must sum to 100"
+
     overFetch = 3  # fetch 3× what we need from each bucket
     seen: set[str] = set()
-
-    def isScreenshot(a: dict[str, Any]) -> bool:
-        """Detect screenshots by filename pattern."""
-        name = (a.get("originalFileName") or "").lower()
-        return "screenshot" in name or "screen shot" in name
+    seenDuplicateGroups: set[str] = set()
 
     def dedup(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Return image-only, non-screenshot assets not already seen."""
+        """Return assets that pass rejectReason and are not already seen.
+
+        Only one asset per Immich duplicate group is kept.
+        """
         out: list[dict[str, Any]] = []
-        # Loop invariant: out contains only unique IMAGE assets whose IDs
-        # are in seen, with no screenshots.
+        # Loop invariant: every asset in out has an unseen id and an unseen
+        # duplicateId (if any), and passed rejectReason.
         for a in assets:
             aid = a.get("id")
-            if aid and aid not in seen and not isScreenshot(a):
-                seen.add(aid)
-                out.append(a)
+            dupId = a.get("duplicateId")
+            if not aid or aid in seen or (dupId and dupId in seenDuplicateGroups):
+                continue
+            if rejectReason(a):
+                continue
+            seen.add(aid)
+            if dupId:
+                seenDuplicateGroups.add(dupId)
+            out.append(a)
         return out
+
+    def slice_(pct: float) -> int:
+        """Convert a percentage of *count* into a fetch target (with over-fetch).
+
+        Always fetch at least 1 if pct > 0, so a small percentage on a small
+        count doesn't round to zero.
+        """
+        share = max(1, round(count * pct / 100.0)) if pct > 0 else 0
+        return share * overFetch
 
     today = date.today()
 
-    # --- Memories (hard cap: 10 from "on this day") ---
-    memTarget = min(10, count // 2) * overFetch
-    print(f"Looking for 'on this day' memories ({today.strftime('%B %d')})…")
-    rawMemories = getMemories(client, today)
-    random.shuffle(rawMemories)
-    memories = dedup(rawMemories)[:memTarget]
-    print(f"  Found {len(rawMemories)}, using {len(memories)} candidate(s).")
+    # --- Memories ---
+    memTarget = slice_(memoryPct)
+    if memTarget:
+        print(f"Looking for 'on this day' memories ({today.strftime('%B %d')})…")
+        rawMemories = getMemories(client, today)
+        random.shuffle(rawMemories)
+        memories = dedup(rawMemories)[:memTarget]
+        print(f"  Found {len(rawMemories)}, using {len(memories)} candidate(s).")
+    else:
+        memories = []
 
-    # --- Random (fills the rest) ---
-    randTarget = (count - min(10, count // 2)) * overFetch
-    print(f"Fetching random photos…")
-    rawRandom = getRandomAssets(client, max(randTarget, 50))
-    randoms = dedup(rawRandom)[:randTarget]
-    print(f"  Got {len(randoms)} random candidate(s).")
+    # --- Random ---
+    randTarget = slice_(randomPct)
+    if randTarget:
+        print(f"Fetching random photos…")
+        randoms: list[dict[str, Any]] = []
+        # Most random assets fail the metadata filters, so keep asking.
+        # ponytail: fixed round limit; a small library may not fill the target.
+        for _ in range(20):
+            randoms += dedup(getRandomAssets(client, 1000))
+            if len(randoms) >= randTarget:
+                break
+        randoms = randoms[:randTarget]
+        print(f"  Got {len(randoms)} random candidate(s).")
+    else:
+        randoms = []
 
-    # --- Favorites (sprinkle in a few) ---
-    favTarget = count * overFetch // 6
-    print(f"Fetching favorites…")
-    rawFavs = getFavorites(client, max(favTarget, 50))
-    random.shuffle(rawFavs)
-    favs = dedup(rawFavs)[:favTarget]
-    print(f"  Found {len(rawFavs)}, using {len(favs)} candidate(s).")
+    # --- Favorites ---
+    favTarget = slice_(favoritePct)
+    if favTarget:
+        print(f"Fetching favorites…")
+        rawFavs = getFavorites(client, 1000)
+        random.shuffle(rawFavs)
+        favs = dedup(rawFavs)[:favTarget]
+        print(f"  Found {len(rawFavs)}, using {len(favs)} candidate(s).")
+    else:
+        favs = []
 
     # Interleave: round-robin from the three buckets, then append leftovers.
     # This ensures variety even if the download loop stops early.
     interleaved: list[dict[str, Any]] = []
-    buckets = [memories, randoms, favs]  # memories and randoms alternate, favs fill in
+    buckets = [randoms, memories, favs]
     maxLen = max((len(b) for b in buckets), default=0)
     # Loop invariant: interleaved contains at most i * len(buckets) items.
     for i in range(maxLen):
@@ -341,7 +443,35 @@ def main() -> None:
         default=20,
         help="Number of photos to download (default: 20)",
     )
+    parser.add_argument(
+        "--random-pct",
+        type=float,
+        default=90.0,
+        help="Percentage of photos drawn at random (default: 90)",
+    )
+    parser.add_argument(
+        "--memory-pct",
+        type=float,
+        default=8.0,
+        help="Percentage drawn from 'on this day' memories (default: 8)",
+    )
+    parser.add_argument(
+        "--favorite-pct",
+        type=float,
+        default=2.0,
+        help="Percentage drawn from favorited photos (default: 2)",
+    )
     args = parser.parse_args()
+
+    # Pre-condition: the three percentages must sum to 100 (within rounding).
+    pctSum = args.random_pct + args.memory_pct + args.favorite_pct
+    if abs(pctSum - 100.0) > 0.01:
+        print(
+            f"Error: --random-pct + --memory-pct + --favorite-pct must sum to 100; "
+            f"got {pctSum:g} ({args.random_pct:g} + {args.memory_pct:g} + {args.favorite_pct:g}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Pre-conditions: environment variables must be set.
     baseUrl = os.environ.get("IMMICH_URL")
@@ -372,21 +502,31 @@ def main() -> None:
         )
         sys.exit(1)
 
-    assets = curate(client, args.count)
+    assets = curate(
+        client,
+        args.count,
+        randomPct=args.random_pct,
+        memoryPct=args.memory_pct,
+        favoritePct=args.favorite_pct,
+    )
     if not assets:
         print("No assets found — nothing to download.", file=sys.stderr)
         sys.exit(1)
 
-    # Prepare output directory: clear old contents, keep the directory itself.
+    # Output directory: re-runs overwrite previous output in place so cached
+    # file lists on the display side keep working (the underlying photo at
+    # e.g. 001.jpg may change, but the filename stays the same).
     outDir.mkdir(parents=True, exist_ok=True)
-    for f in outDir.iterdir():
-        f.unlink()
 
     targetCount = args.count
     print(f"\nFiltering {len(assets)} candidate(s) and downloading up to {targetCount} to {outDir}/ …")
     downloaded = 0
     skippedBoring = 0
     skippedError = 0
+    # Per-extension sequential counter, starting at 0 (000.jpg, 001.jpg, …
+    # and independently 000.mov, 001.mov, …).  Key is the lowercase suffix
+    # including the leading dot.
+    extCounters: dict[str, int] = {}
     # Loop invariant: downloaded + skippedBoring + skippedError == number of
     # candidates processed so far; downloaded <= targetCount.
     for asset in assets:
@@ -411,20 +551,32 @@ def main() -> None:
                 skippedBoring += 1
                 continue
 
-        # --- Download the full-resolution image ---
-        idx = downloaded + 1
-        stem = Path(origName).stem
-        suffix = Path(origName).suffix or ".jpg"
-        outPath = outDir / f"{idx:02d}-{stem}{suffix}"
-
-        ok, outPath = downloadAsset(client, assetId, outPath)
-        if ok:
-            writeSidecar(outPath, asset)
-            downloaded += 1
-            size = outPath.stat().st_size
-            print(f"  [{downloaded}/{targetCount}] {outPath.name}  ({size / 1024:.0f} KB)")
-        else:
+        # --- Download to a temp path, then rename to its sequential name ---
+        # Immich may correct the extension based on Content-Type, so we don't
+        # know the final ext until after the download completes.
+        tempSuffix = Path(origName).suffix or ".jpg"
+        tempPath = outDir / f".tmp-{assetId}{tempSuffix}"
+        ok, downloadPath = downloadAsset(client, assetId, tempPath)
+        if not ok:
+            # downloadAsset already printed an error; clean up if a partial
+            # file was created.
+            if tempPath.exists():
+                tempPath.unlink()
             skippedError += 1
+            continue
+
+        ext = downloadPath.suffix.lower() or ".jpg"
+        idx = extCounters.get(ext, 0)
+        extCounters[ext] = idx + 1
+        finalPath = outDir / f"{idx:03d}{ext}"
+        # Path.replace is atomic on POSIX — overwrites any existing file at
+        # finalPath, including its sidecar siblings on the next line.
+        downloadPath.replace(finalPath)
+
+        writeSidecar(finalPath, asset)
+        downloaded += 1
+        size = finalPath.stat().st_size
+        print(f"  [{downloaded}/{targetCount}] {finalPath.name}  ({size / 1024:.0f} KB)")
 
     print(f"\nDone — {downloaded} photo(s) saved to {outDir}/")
     if skippedBoring:
